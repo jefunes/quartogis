@@ -1,0 +1,729 @@
+---
+title: "Workforce Analysis"
+author: "Your Name"
+date: "today"
+format: html
+editor: visual
+---
+
+## Introduction
+
+This report analyzes workforce data to identify key trends and insights. We will explore employee demographics, hiring patterns, and retention rates to understand the current state of our workforce and inform future strategies.
+
+## Data Loading and Preparation
+
+The first step is to load the necessary R packages and the workforce dataset. We will then perform initial data cleaning and preparation to ensure the data is ready for analysis.
+
+```{{r load-data}}
+# Clean up the environment (removed as per instructions)
+# rm(list=ls())
+
+# Load required packages
+spatial_packages <- c("sf", "cowplot", "USAboundaries", "USAboundariesData", "tmap", "tmaptools", "tigris")
+census_bureau_data_packages <- c("tidycensus", "censusapi")
+other_packages <- c("tidyverse", "DBI", "duckdb", "knitr", "data.table", "lubridate", "stringr", "readr", "downloadthis", "RColorBrewer", "ggiraph") # Added downloadthis, RColorBrewer, ggiraph
+
+# Install and load spatial packages
+lapply(spatial_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+})
+
+# Install and load Census Bureau data packages
+lapply(census_bureau_data_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+})
+
+# Install and load other packages
+lapply(other_packages, function(pkg) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, dependencies = TRUE)
+    library(pkg, character.only = TRUE)
+  }
+})
+
+# --- Database Connection ---
+# Ensure DUCKDB_FILE_PATH environment variable is set to the path of your .duckdb file.
+con <- tryCatch({
+  dbConnect(duckdb::duckdb(dbdir = Sys.getenv("DUCKDB_FILE_PATH")))
+}, error = function(e) {
+  message("Failed to connect to the database. Please check DUCKDB_FILE_PATH and database integrity.")
+  message("Error details: ", e$message)
+  NULL # Return NULL if connection fails
+})
+
+# Proceed only if the connection was successful
+if (!is.null(con)) {
+  # List all tables in the database
+  print(dbListTables(con))
+
+  # --- Import Tables from DuckDB ---
+  # Define SQL queries for each table
+  sql_queries <- list(
+    acs_data = "SELECT * FROM acs_data;", # Placeholder, actual PWD variables are in acs_pwd_var_by_*
+    lehd_data = "SELECT * FROM lehd_data;",
+    national_county_population = "SELECT * FROM national_county_population;",
+    national_state_population = "SELECT * FROM national_state_population;",
+    laus_data = "SELECT * FROM laus_data;",
+    qcew_data = "SELECT * FROM qcew_data;",
+    income_limits_data = "SELECT * FROM income_limits_data;",
+    median_income_data = "SELECT * FROM median_income_data;",
+    per_capita_income_data = "SELECT * FROM per_capita_income_data;",
+    # Adding placeholders for PWD Almanac specific tables, assuming they are in the DB
+    acs_pwd_var_by_states_workforce_almanac = "SELECT * FROM acs_pwd_var_by_states_workforce_almanac;",
+    acs_pwd_var_by_counties_workforce_almanac = "SELECT * FROM acs_pwd_var_by_counties_workforce_almanac;",
+    acs_pwd_var_by_metro_workforce_almanac = "SELECT * FROM acs_pwd_var_by_metro_workforce_almanac;"
+  )
+
+  # Loop through the queries and import data, handling potential errors for each query
+  for (table_name in names(sql_queries)) {
+    current_query <- sql_queries[[table_name]]
+    assign(table_name, tryCatch({
+      dbGetQuery(con, current_query)
+    }, error = function(e) {
+      message(paste("Failed to retrieve data for table:", table_name))
+      message("Query: ", current_query)
+      message("Error details: ", e$message)
+      NULL # Return NULL if query fails
+    }))
+  }
+
+  # --- Database Disconnection ---
+  tryCatch({
+    dbDisconnect(con, shutdown = TRUE)
+    message("Successfully disconnected from the database.")
+  }, error = function(e) {
+    message("Failed to disconnect from the database.")
+    message("Error details: ", e$message)
+  })
+
+} else {
+  message("Database connection was not established. Skipping data import and disconnection steps.")
+}
+
+# --- Data Post-processing and Geographic Data ---
+# Create GEOID_STATE1 column by extracting the first two characters from GEOID in acs_data
+if (exists("acs_data") && !is.null(acs_data) && "GEOID" %in% names(acs_data)) {
+  acs_data$GEOID_STATE1 <- substr(acs_data$GEOID, 1, 2)
+} else {
+  message("acs_data is not available or does not contain GEOID column. Skipping GEOID_STATE1 creation.")
+}
+
+# Download state boundaries shapefile using tigris
+states_sf <- tryCatch({
+  states(cb = TRUE, resolution = "500k") # cb=TRUE for cartographic boundary files
+}, error = function(e) {
+  message("Failed to download state shapefiles using tigris.")
+  message("Error details: ", e$message)
+  NULL
+})
+
+# Create a tmap object for U.S. states if states_sf is available
+if (!is.null(states_sf)) {
+  tm_states <- tm_shape(states_sf) +
+    tm_polygons() +
+    tm_layout(title = "U.S. States", frame = FALSE)
+  # print(tm_states) # Removed print from here, will be printed in map chunks
+} else {
+  message("State shapefile data (states_sf) is not available. Skipping tmap object creation.")
+}
+
+# Display the first few rows and summary of a key dataset (e.g., acs_data) for initial inspection
+if (exists("acs_data") && !is.null(acs_data)) {
+  print("Head of acs_data:")
+  print(head(acs_data))
+  print("Summary of acs_data:")
+  summary(acs_data)
+} else {
+  message("acs_data is not available for initial inspection.")
+}
+```
+
+## Data Merging and Refinement
+
+This section focuses on merging different datasets and refining variables for PWD analysis by state, county, and metropolitan statistical areas (MSAs). The data is sourced from the American Community Survey (ACS) Public Use Microdata Sample (PUMS) and has been preprocessed into dataframes: `acs_pwd_var_by_states_workforce_almanac`, `acs_pwd_var_by_counties_workforce_almanac`, and `acs_pwd_var_by_metro_workforce_almanac`. The primary operation here is rounding numerical values to one decimal place for consistency and improved readability in subsequent analyses and visualizations.
+
+```{{r merge-data}}
+# Ensure the necessary dataframes are loaded from the 'load-data' chunk.
+# These include: acs_pwd_var_by_states_workforce_almanac,
+# acs_pwd_var_by_counties_workforce_almanac,
+# and acs_pwd_var_by_metro_workforce_almanac.
+
+# Round specified columns to one decimal place for state-level data to improve readability in tables and maps
+if (exists("acs_pwd_var_by_states_workforce_almanac") && !is.null(acs_pwd_var_by_states_workforce_almanac) && nrow(acs_pwd_var_by_states_workforce_almanac) > 0) {
+  acs_pwd_var_by_states_workforce_almanac <- acs_pwd_var_by_states_workforce_almanac %>%
+    mutate(
+      total_providers_per_10k_labor_force_pwd = round(total_providers_per_10k_labor_force_pwd, 1), # Rate of providers per 10k PWD in labor force
+      EmploymentPopulationRatio = round(EmploymentPopulationRatio, 1), # Employment-Population Ratio for PWD
+      UnemploymentRatePWD = round(UnemploymentRatePWD, 1), # Unemployment Rate for PWD
+      LaborForceRatePWD18_64 = round(LaborForceRatePWD18_64, 1), # Labor Force Participation Rate for PWD (18-64)
+      S1810_C03_001E = round(S1810_C03_001E, 1), # Disability prevalence estimate
+      S1810_C03_001M = round(S1810_C03_001M, 1) # Margin of error for disability prevalence
+    )
+  message("State-level PWD data rounded.")
+} else {
+  message("State-level PWD data (acs_pwd_var_by_states_workforce_almanac) not found or empty. Skipping rounding.")
+}
+
+# Round specified columns to one decimal place for county-level data to improve readability
+if (exists("acs_pwd_var_by_counties_workforce_almanac") && !is.null(acs_pwd_var_by_counties_workforce_almanac) && nrow(acs_pwd_var_by_counties_workforce_almanac) > 0) {
+  acs_pwd_var_by_counties_workforce_almanac <- acs_pwd_var_by_counties_workforce_almanac %>%
+    mutate(
+      total_providers_per_10k_labor_force_pwd = round(total_providers_per_10k_labor_force_pwd, 1),
+      EmploymentPopulationRatio = round(EmploymentPopulationRatio, 1),
+      UnemploymentRatePWD = round(UnemploymentRatePWD, 1),
+      LaborForceRatePWD18_64 = round(LaborForceRatePWD18_64, 1),
+      S1810_C03_001E = round(S1810_C03_001E, 1),
+      S1810_C03_001M = round(S1810_C03_001M, 1)
+    )
+  message("County-level PWD data rounded.")
+} else {
+  message("County-level PWD data (acs_pwd_var_by_counties_workforce_almanac) not found or empty. Skipping rounding.")
+}
+
+# Round specified columns to one decimal place for metro-level data to improve readability
+if (exists("acs_pwd_var_by_metro_workforce_almanac") && !is.null(acs_pwd_var_by_metro_workforce_almanac) && nrow(acs_pwd_var_by_metro_workforce_almanac) > 0) {
+  acs_pwd_var_by_metro_workforce_almanac <- acs_pwd_var_by_metro_workforce_almanac %>%
+    mutate(
+      total_providers_per_10k_labor_force_pwd = round(total_providers_per_10k_labor_force_pwd, 1),
+      EmploymentPopulationRatio = round(EmploymentPopulationRatio, 1),
+      UnemploymentRatePWD = round(UnemploymentRatePWD, 1),
+      LaborForceRatePWD18_64 = round(LaborForceRatePWD18_64, 1),
+      S1810_C03_001E = round(S1810_C03_001E, 1),
+      S1810_C03_001M = round(S1810_C03_001M, 1)
+    )
+  message("Metro-level PWD data rounded.")
+} else {
+  message("Metro-level PWD data (acs_pwd_var_by_metro_workforce_almanac) not found or empty. Skipping rounding.")
+}
+
+# Example: Display summary of the modified dataframes
+if (exists("acs_pwd_var_by_states_workforce_almanac")) print(summary(acs_pwd_var_by_states_workforce_almanac))
+if (exists("acs_pwd_var_by_counties_workforce_almanac")) print(summary(acs_pwd_var_by_counties_workforce_almanac))
+if (exists("acs_pwd_var_by_metro_workforce_almanac")) print(summary(acs_pwd_var_by_metro_workforce_almanac))
+```
+
+## Map Data Preparation
+
+This section prepares the data and base map objects required for generating thematic maps. It involves filtering datasets, classifying data for visualization, merging attribute data with spatial data, and defining map aesthetics like color palettes and pop-up content.
+
+```{{r get-maps-ready}}
+# Ensure necessary dataframes and spatial objects are available.
+us_states_no_territories <- c("01", "02", "04", "05", "06", "08", "09", "10", "11", "12", "13", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "44", "45", "46", "47", "48", "49", "50", "51", "53", "54", "55", "56")
+
+# --- State Level Map Preparation ---
+if (exists("states_sf") && !is.null(states_sf) && exists("acs_pwd_var_by_states_workforce_almanac")) {
+  map_state_workforce_almanac_acs_var_pwd <- merge(states_sf, acs_pwd_var_by_states_workforce_almanac, by.x = "GEOID", by.y = "GEOID", all.x = TRUE)
+  map_state_workforce_almanac_acs_var_pwd <- map_state_workforce_almanac_acs_var_pwd %>% filter(GEOID %in% us_states_no_territories)
+  message("State-level map data prepared.")
+} else {
+  message("State shapefiles (states_sf) or acs_pwd_var_by_states_workforce_almanac not available for merging.")
+}
+
+# --- County Level Map Preparation ---
+if (exists("acs_pwd_var_by_counties_workforce_almanac")) {
+  acs_pwd_var_by_counties_workforce_almanac_filtered <- subset(acs_pwd_var_by_counties_workforce_almanac, GEOID_STATE1 %in% us_states_no_territories)
+
+  acs_pwd_var_by_counties_workforce_almanac_classified <- acs_pwd_var_by_counties_workforce_almanac_filtered %>%
+    mutate(
+      number_wtp_class = case_when(
+        total_number_of_workforce_providers == 0 ~ "0",
+        total_number_of_workforce_providers >= 1 & total_number_of_workforce_providers < 5 ~ "1-5",
+        total_number_of_workforce_providers >= 5 & total_number_of_workforce_providers < 23 ~ "5-23",
+        total_number_of_workforce_providers >= 23 & total_number_of_workforce_providers < 76 ~ "23-76",
+        total_number_of_workforce_providers >= 76 & total_number_of_workforce_providers < 129 ~ "76-129",
+        total_number_of_workforce_providers >= 129 ~ "129+",
+        TRUE ~ NA_character_
+      ),
+      rate_wtp_class = case_when(
+        total_providers_per_10k_labor_force_pwd == 0 ~ "0",
+        total_providers_per_10k_labor_force_pwd > 0 & total_providers_per_10k_labor_force_pwd < 20.3 ~ "0-20.3",
+        total_providers_per_10k_labor_force_pwd >= 20.3 & total_providers_per_10k_labor_force_pwd < 89.1 ~ "20.3-89.1",
+        total_providers_per_10k_labor_force_pwd >= 89.1 & total_providers_per_10k_labor_force_pwd < 218.6 ~ "89.1-218.6",
+        total_providers_per_10k_labor_force_pwd >= 218.6 & total_providers_per_10k_labor_force_pwd < 453.5 ~ "218.6-453.5",
+        total_providers_per_10k_labor_force_pwd >= 453.5 ~ "453.5+",
+        TRUE ~ NA_character_
+      )
+    )
+  message("County data classified.")
+
+  counties_sf <- tryCatch(counties(cb = TRUE, resolution = "500k"), error = function(e) { message("Failed to download county shapefiles: ", e$message); NULL })
+  if (!is.null(counties_sf)) {
+    map_county_workforce_almanac_acs_var_pwd <- merge(counties_sf, acs_pwd_var_by_counties_workforce_almanac_classified, by.x = "GEOID", by.y = "GEOID", all.x = TRUE)
+    message("County-level map data prepared.")
+  } else { message("County shapefiles not available.") }
+} else { message("County data not available for classification.") }
+
+# --- MSA Level Map Preparation ---
+if (exists("acs_pwd_var_by_metro_workforce_almanac")) {
+  acs_pwd_var_by_metro_workforce_almanac_filtered <- acs_pwd_var_by_metro_workforce_almanac %>% filter(metro_area == 1 & puerto_rico == 0)
+
+  acs_pwd_var_by_metro_workforce_almanac_classified <- acs_pwd_var_by_metro_workforce_almanac_filtered %>%
+    mutate(
+      # Classify MSAs by the number of workforce training providers
+      # Mean = 38; median=12; sd = 79, 1q = 7, 3q=30; max 797 (from original issue)
+      number_wtp_class = case_when(
+        total_number_of_workforce_providers == 0 ~ "0", # Changed from numeric 0 to string "0" for consistency if classes are factors
+        total_number_of_workforce_providers >= 1 & total_number_of_workforce_providers < 12 ~ "1-11", # Class 1
+        total_number_of_workforce_providers >= 12 & total_number_of_workforce_providers < 38 ~ "12-37", # Class 2
+        total_number_of_workforce_providers >= 38 & total_number_of_workforce_providers < 79 ~ "38-78", # Class 3
+        total_number_of_workforce_providers >= 79 & total_number_of_workforce_providers < 158 ~ "79-157", # Class 4
+        total_number_of_workforce_providers >= 158 & total_number_of_workforce_providers <= 797 ~ "158-797", # Class 5, includes max
+        is.na(total_number_of_workforce_providers) ~ "0", # Assuming NA means no providers, maps to class "0"
+        TRUE ~ NA_character_ # Default case for any unexpected values
+      ),
+      # Classify MSAs by the rate of workforce training providers per 10,000 PWD in labor force
+      # Mean = 16; median=16; sd = 8, 1q = 11, 3q=20; max 74 (from original issue)
+      rate_wtp_class = case_when(
+        total_providers_per_10k_labor_force_pwd == 0 ~ "0", # Changed from numeric 0 to string "0"
+        total_providers_per_10k_labor_force_pwd > 0 & total_providers_per_10k_labor_force_pwd < 11 ~ "1-10", # Class 1 (adjusted to >0)
+        total_providers_per_10k_labor_force_pwd >= 11 & total_providers_per_10k_labor_force_pwd < 16 ~ "11-15", # Class 2
+        total_providers_per_10k_labor_force_pwd >= 16 & total_providers_per_10k_labor_force_pwd < 20 ~ "16-19", # Class 3
+        total_providers_per_10k_labor_force_pwd >= 20 & total_providers_per_10k_labor_force_pwd <= 74 ~ "20-74", # Class 4, includes max
+        is.na(total_providers_per_10k_labor_force_pwd) ~ "0", # Assuming NA means no providers, maps to class "0"
+        TRUE ~ NA_character_ # Default case
+      )
+    )
+  message("MSA data classified with complete logic.")
+
+  msa_sf <- tryCatch(core_based_statistical_areas(cb = TRUE, resolution = "500k"), error = function(e) { message("Failed to download MSA shapefiles: ", e$message); NULL })
+  if (!is.null(msa_sf)) {
+    map_msa_workforce_almanac_acs_var_pwd <- merge(msa_sf, acs_pwd_var_by_metro_workforce_almanac_classified, by.x = "GEOID", by.y = "GEOID", all.x = TRUE)
+    message("MSA-level map data prepared.")
+  } else { message("MSA shapefiles not available.") }
+} else { message("MSA data not available for classification.") }
+
+# --- Base Map and Palette Definition ---
+if (!is.null(states_sf)) {
+  states_tmap <- tm_shape(states_sf) + tm_borders(col = "black", alpha = 0.8) + tm_text("NAME", size = 0.5, remove.overlap = TRUE)
+  message("Base states_tmap object created.")
+} else { message("Base states_tmap not created.") }
+
+pal_RdBu_rev <- rev(RColorBrewer::brewer.pal(6, "RdBu"))
+palette_with_na <- c("#F5F5F5", pal_RdBu_rev)
+message("Color palettes defined.")
+
+pop_up_window <- c("Name" = "NAME", "Total Number of Workforce Providers" = "total_number_of_workforce_providers", "Total Providers per 10k Labor Force (PWD)" = "total_providers_per_10k_labor_force_pwd", "Labor Force Participation Rate (PWD 18-64)" = "LaborForceRatePWD18_64", "Employment-Population Ratio (PWD)" = "EmploymentPopulationRatio", "Unemployment Rate (PWD)" = "UnemploymentRatePWD")
+message("Pop-up window variables defined.")
+
+# --- Initial tmap Object Definitions ---
+# State-level
+if (exists("map_state_workforce_almanac_acs_var_pwd") && !is.null(map_state_workforce_almanac_acs_var_pwd)) {
+  state_total_num_providers <- tm_shape(map_state_workforce_almanac_acs_var_pwd, title = "Total Workforce Providers by State") + tm_polygons("total_number_of_workforce_providers", popup.vars = pop_up_window)
+  state_total_num_providers_per_10 <- tm_shape(map_state_workforce_almanac_acs_var_pwd, title = "Providers per 10k PWD in Labor Force by State") + tm_polygons("total_providers_per_10k_labor_force_pwd", popup.vars = pop_up_window)
+  message("Initial state-level tmap objects created.")
+}
+# County-level
+if (exists("map_county_workforce_almanac_acs_var_pwd") && !is.null(map_county_workforce_almanac_acs_var_pwd)) {
+  county_total_num_providers <- tm_shape(map_county_workforce_almanac_acs_var_pwd, title = "Number of Workforce Providers by County (Classified)") + tm_polygons("number_wtp_class", palette = palette_with_na, popup.vars = pop_up_window)
+  county_rate_wtp_per_10k <- tm_shape(map_county_workforce_almanac_acs_var_pwd, title = "Rate of Providers per 10k PWD by County (Classified)") + tm_polygons("rate_wtp_class", palette = palette_with_na, popup.vars = pop_up_window)
+  message("Initial county-level tmap objects created.")
+}
+# MSA-level
+if (exists("map_msa_workforce_almanac_acs_var_pwd") && !is.null(map_msa_workforce_almanac_acs_var_pwd)) {
+  msa_total_num_providers <- tm_shape(map_msa_workforce_almanac_acs_var_pwd, title = "Number of Workforce Providers by MSA (Classified)") + tm_polygons("number_wtp_class", palette = palette_with_na, popup.vars = pop_up_window)
+  msa_total_num_providers_per_10k <- tm_shape(map_msa_workforce_almanac_acs_var_pwd, title = "Rate of Providers per 10k PWD by MSA (Classified)") + tm_polygons("rate_wtp_class", palette = palette_with_na, popup.vars = pop_up_window)
+  message("Initial MSA-level tmap objects created.")
+}
+
+tmap_options(tmap.mode = "view") # Set default tmap mode
+message("tmap_options set to view mode. Map data preparation chunk executed.")
+```
+
+## Downloadable Data Products
+
+This section provides download links for the processed datasets at state, county, and MSA levels. The data includes key variables related to workforce training providers and people with disabilities (PWD). Files are generated with the current date to ensure version tracking.
+
+```{{r download-data, results='asis'}}
+# Ensure the downloadthis package is loaded
+if (!require(downloadthis)) {
+  install.packages("downloadthis")
+  library(downloadthis)
+}
+
+# --- State-Level Data Download ---
+if (exists("acs_pwd_var_by_states_workforce_almanac") && !is.null(acs_pwd_var_by_states_workforce_almanac) && nrow(acs_pwd_var_by_states_workforce_almanac) > 0) {
+  states_workforce_training_providers <- acs_pwd_var_by_states_workforce_almanac[,c("NAME","GEOID","total_number_of_workforce_providers","total_providers_per_10k_labor_force_pwd", "EmploymentPopulationRatio","UnemploymentRatePWD","LaborForceRatePWD18_64", "S1810_C03_001E","S1810_C03_001M")]
+  states_workforce_training_providers <- states_workforce_training_providers %>% rename( State_Name = NAME, State_GEOID = GEOID, Total_Workforce_Providers = total_number_of_workforce_providers, Rate_of_Workforce_Training_Providers_per_10k_Labor_Force_PWD = total_providers_per_10k_labor_force_pwd, Employment_Population_Ratio_PWD = EmploymentPopulationRatio, Unemployment_Rate_PWD = UnemploymentRatePWD, Labor_Force_Participation_Rate_PWD_18_64 = LaborForceRatePWD18_64, Disability_Prevalence_Estimate_S1810_C03_001E = S1810_C03_001E, Margin_of_Error_Disability_Prevalence_S1810_C03_001M = S1810_C03_001M)
+  state_file_name <- paste0("state_workforce_providers_data_", Sys.Date(), ".xlsx")
+  download_this( states_workforce_training_providers, output_name = state_file_name, output_extension = ".xlsx", button_label = paste("Download State Level Data (", Sys.Date(), ")"), button_type = "default", has_icon = TRUE, icon = "fa fa-file-excel" )
+  message("State data download button prepared.")
+} else { message("State data not available or empty. Download button not created.") }
+
+# --- County-Level Data Download ---
+if (exists("acs_pwd_var_by_counties_workforce_almanac_classified") && !is.null(acs_pwd_var_by_counties_workforce_almanac_classified) && nrow(acs_pwd_var_by_counties_workforce_almanac_classified) > 0) { # Using classified for download
+  counties_workforce_training_providers <- acs_pwd_var_by_counties_workforce_almanac_classified[,c("NAME","GEOID","GEOID_STATE1","total_number_of_workforce_providers","total_providers_per_10k_labor_force_pwd", "EmploymentPopulationRatio","UnemploymentRatePWD","LaborForceRatePWD18_64", "S1810_C03_001E","S1810_C03_001M", "number_wtp_class", "rate_wtp_class")]
+  counties_workforce_training_providers <- counties_workforce_training_providers %>% rename( County_Name = NAME, County_GEOID = GEOID, State_GEOID = GEOID_STATE1, Total_Workforce_Providers = total_number_of_workforce_providers, Rate_of_Workforce_Training_Providers_per_10k_Labor_Force_PWD = total_providers_per_10k_labor_force_pwd, Employment_Population_Ratio_PWD = EmploymentPopulationRatio, Unemployment_Rate_PWD = UnemploymentRatePWD, Labor_Force_Participation_Rate_PWD_18_64 = LaborForceRatePWD18_64, Disability_Prevalence_Estimate_S1810_C03_001E = S1810_C03_001E, Margin_of_Error_Disability_Prevalence_S1810_C03_001M = S1810_C03_001M, Num_Providers_Class = number_wtp_class, Rate_Providers_Class = rate_wtp_class)
+  county_file_name <- paste0("county_workforce_providers_data_", Sys.Date(), ".xlsx")
+  download_this( counties_workforce_training_providers, output_name = county_file_name, output_extension = ".xlsx", button_label = paste("Download County Level Data (", Sys.Date(), ")"), button_type = "default", has_icon = TRUE, icon = "fa fa-file-excel" )
+  message("County data download button prepared.")
+} else { message("County data not available or empty. Download button not created.") }
+
+# --- MSA-Level Data Download ---
+if (exists("acs_pwd_var_by_metro_workforce_almanac_classified") && !is.null(acs_pwd_var_by_metro_workforce_almanac_classified) && nrow(acs_pwd_var_by_metro_workforce_almanac_classified) > 0) { # Using classified for download
+  msa_workforce_training_providers <- acs_pwd_var_by_metro_workforce_almanac_classified[,c("NAME","GEOID","total_number_of_workforce_providers","total_providers_per_10k_labor_force_pwd", "EmploymentPopulationRatio","UnemploymentRatePWD","LaborForceRatePWD18_64", "S1810_C03_001E","S1810_C03_001M", "number_wtp_class", "rate_wtp_class")]
+  msa_workforce_training_providers <- msa_workforce_training_providers %>% rename( MSA_Name = NAME, MSA_GEOID = GEOID, Total_Workforce_Providers = total_number_of_workforce_providers, Rate_of_Workforce_Training_Providers_per_10k_Labor_Force_PWD = total_providers_per_10k_labor_force_pwd, Employment_Population_Ratio_PWD = EmploymentPopulationRatio, Unemployment_Rate_PWD = UnemploymentRatePWD, Labor_Force_Participation_Rate_PWD_18_64 = LaborForceRatePWD18_64, Disability_Prevalence_Estimate_S1810_C03_001E = S1810_C03_001E, Margin_of_Error_Disability_Prevalence_S1810_C03_001M = S1810_C03_001M, Num_Providers_Class = number_wtp_class, Rate_Providers_Class = rate_wtp_class)
+  metro_file_name <- paste0("metro_workforce_providers_data_", Sys.Date(), ".xlsx")
+  download_this( msa_workforce_training_providers, output_name = metro_file_name, output_extension = ".xlsx", button_label = paste("Download MSA Level Data (", Sys.Date(), ")"), button_type = "default", has_icon = TRUE, icon = "fa fa-file-excel" )
+  message("MSA data download button prepared.")
+} else { message("MSA data not available or empty. Download button not created.") }
+
+message("Downloadable data products chunk executed.")
+```
+
+## Visualizing State-Level Data
+
+This section presents choropleth maps showing the distribution of workforce training providers across U.S. states. These maps help identify states with higher or lower concentrations of these resources, both in absolute numbers and relative to the population of people with disabilities in the labor force.
+
+### Map 1: Total Number of Workforce Training Providers by State
+
+```{{r map-state-1, message=FALSE, code-fold=true, fig-alt="Choropleth map of US states showing the total number of workforce training providers. States with more providers are shaded darker. Pop-ups provide details on hover."}}
+# The map object 'state_total_num_providers' is created in the 'get-maps-ready' chunk.
+# Map view is centered on the continental US.
+if (exists("state_total_num_providers")) {
+  state_total_num_providers +
+    tm_view(set.view = c(lon = -98.5795, lat = 39.8283, zoom = 3))
+} else {
+  message("Map object 'state_total_num_providers' not found. Ensure 'get-maps-ready' chunk has run successfully.")
+}
+```
+
+You can download the data used in this map:
+```{{r download-states-1, echo=FALSE, results='asis'}}
+if (exists("states_workforce_training_providers")) {
+  download_this(
+    states_workforce_training_providers,
+    output_name = paste0("state_total_providers_data_", Sys.Date()),
+    output_extension = ".xlsx",
+    button_label = paste("Download Data for Map 1 (States - Total Providers, ", Sys.Date(), ")"),
+    button_type = "default",
+    has_icon = TRUE,
+    icon = "fa fa-file-excel"
+  )
+} else {
+  message("Data object 'states_workforce_training_providers' not found for download.")
+}
+```
+
+### Map 2: Rate of Workforce Training Providers per 10,000 PWD in Labor Force by State
+
+```{{r map-state-2, message=FALSE, code-fold=true, fig-alt="Choropleth map of US states showing the rate of workforce training providers per 10,000 people with disabilities (PWD) in the labor force. States with higher rates are shaded darker. Pop-ups provide details on hover."}}
+# The map object 'state_total_num_providers_per_10' is created in the 'get-maps-ready' chunk.
+if (exists("state_total_num_providers_per_10")) {
+  state_total_num_providers_per_10 +
+    tm_view(set.view = c(lon = -98.5795, lat = 39.8283, zoom = 3))
+} else {
+  message("Map object 'state_total_num_providers_per_10' not found.")
+}
+```
+
+You can download the data used in this map (this is the same state-level dataset as for Map 1, containing both metrics):
+```{{r download-states-2, echo=FALSE, results='asis'}}
+if (exists("states_workforce_training_providers")) {
+  download_this(
+    states_workforce_training_providers,
+    output_name = paste0("state_rate_providers_data_", Sys.Date()), # Or use a generic state name if it's identical data file
+    output_extension = ".xlsx",
+    button_label = paste("Download Data for Map 2 (States - Rate of Providers, ", Sys.Date(), ")"),
+    button_type = "default",
+    has_icon = TRUE,
+    icon = "fa fa-file-excel"
+  )
+} else {
+  message("Data object 'states_workforce_training_providers' not found for download.")
+}
+```
+
+## Visualizing County-Level Data
+
+The following maps display workforce training provider data at the county level, offering a more granular view of resource distribution.
+
+### Map 3: Number of Workforce Training Providers by County (Classified)
+
+```{{r map-county-1, message=FALSE, code-fold=true, fig-alt="Choropleth map of US counties showing classified number of workforce training providers. Different colors represent different classes of provider counts. Pop-ups provide details on hover."}}
+# The map object 'county_total_num_providers' is created in 'get-maps-ready'.
+if (exists("county_total_num_providers")) {
+  county_total_num_providers +
+    tm_view(set.view = c(lon = -98.5795, lat = 39.8283, zoom = 3))
+} else {
+  message("Map object 'county_total_num_providers' not found.")
+}
+```
+
+You can download the data used in this map:
+```{{r download-county-1, echo=FALSE, results='asis'}}
+if (exists("counties_workforce_training_providers")) {
+  download_this(
+    counties_workforce_training_providers,
+    output_name = paste0("county_total_providers_data_", Sys.Date()),
+    output_extension = ".xlsx",
+    button_label = paste("Download Data for Map 3 (Counties - Total Providers, ", Sys.Date(), ")"),
+    button_type = "default",
+    has_icon = TRUE,
+    icon = "fa fa-file-excel"
+  )
+} else {
+  message("Data object 'counties_workforce_training_providers' not found for download.")
+}
+```
+
+### Map 4: Rate of Workforce Training Providers per 10,000 PWD in Labor Force by County (Classified)
+
+```{{r map-county-2, message=FALSE, code-fold=true, fig-alt="Choropleth map of US counties showing classified rates of workforce training providers per 10,000 PWD. Different colors represent different classes of rates. Pop-ups provide details on hover."}}
+# The map object 'county_rate_wtp_per_10k' is created in 'get-maps-ready'.
+if (exists("county_rate_wtp_per_10k")) {
+  county_rate_wtp_per_10k +
+    tm_view(set.view = c(lon = -98.5795, lat = 39.8283, zoom = 3))
+} else {
+  message("Map object 'county_rate_wtp_per_10k' not found.")
+}
+```
+
+You can download the data used in this map (this is the same county-level dataset as for Map 3, containing both metrics):
+```{{r download-county-2, echo=FALSE, results='asis'}}
+if (exists("counties_workforce_training_providers")) {
+  download_this(
+    counties_workforce_training_providers,
+    output_name = paste0("county_rate_providers_data_", Sys.Date()),
+    output_extension = ".xlsx",
+    button_label = paste("Download Data for Map 4 (Counties - Rate of Providers, ", Sys.Date(), ")"),
+    button_type = "default",
+    has_icon = TRUE,
+    icon = "fa fa-file-excel"
+  )
+} else {
+  message("Data object 'counties_workforce_training_providers' not found for download.")
+}
+```
+
+## Visualizing MSA-Level Data
+
+Metropolitan Statistical Areas (MSAs) are important economic units. These visualizations explore workforce training provider data within MSAs.
+
+### Map 5: Number of Workforce Training Providers by MSA (Classified)
+
+```{{r map-msa-1, message=FALSE, echo=FALSE, code-fold=true, fig-alt="Choropleth map of US MSAs showing classified number of workforce training providers. Different colors represent different classes of provider counts. Pop-ups provide details on hover."}}
+# The map object 'msa_total_num_providers' is created in 'get-maps-ready'.
+if (exists("msa_total_num_providers")) {
+  msa_total_num_providers +
+    tm_view(set.view = c(lon = -98.5795, lat = 39.8283, zoom = 3))
+} else {
+  message("Map object 'msa_total_num_providers' not found.")
+}
+```
+
+You can download the data used in this map:
+```{{r download-msa-1, echo=FALSE, results='asis'}}
+if (exists("metro_workforce_training_providers")) {
+  download_this(
+    metro_workforce_training_providers,
+    output_name = paste0("msa_total_providers_data_", Sys.Date()),
+    output_extension = ".xlsx",
+    button_label = paste("Download Data for Map 5 (MSAs - Total Providers, ", Sys.Date(), ")"),
+    button_type = "default",
+    has_icon = TRUE,
+    icon = "fa fa-file-excel"
+  )
+} else {
+  message("Data object 'metro_workforce_training_providers' not found for download.")
+}
+```
+
+### Map 6: Rate of Workforce Training Providers per 10,000 PWD in Labor Force by MSA (Classified)
+
+```{{r map-msa-2, message=FALSE, code-fold=true, fig-alt="Choropleth map of US MSAs showing classified rates of workforce training providers per 10,000 PWD. Different colors represent different classes of rates. Pop-ups provide details on hover."}}
+# The map object 'msa_total_num_providers_per_10k' is created in 'get-maps-ready'.
+if (exists("msa_total_num_providers_per_10k")) {
+  msa_total_num_providers_per_10k +
+    tm_view(set.view = c(lon = -98.5795, lat = 39.8283, zoom = 3))
+} else {
+  message("Map object 'msa_total_num_providers_per_10k' not found.")
+}
+```
+
+You can download the data used in this map (this is the same MSA-level dataset as for Map 5, containing both metrics):
+```{{r download-msa-2, echo=FALSE, results='asis'}}
+if (exists("metro_workforce_training_providers")) {
+  download_this(
+    metro_workforce_training_providers,
+    output_name = paste0("msa_rate_providers_data_", Sys.Date()),
+    output_extension = ".xlsx",
+    button_label = paste("Download Data for Map 6 (MSAs - Rate of Providers, ", Sys.Date(), ")"),
+    button_type = "default",
+    has_icon = TRUE,
+    icon = "fa fa-file-excel"
+  )
+} else {
+  message("Data object 'metro_workforce_training_providers' not found for download.")
+}
+```
+
+### Top 25 MSAs by Rate of Workforce Training Providers
+
+```{{r bar-graph-msa-1, echo=FALSE, fig-alt="Bar chart showing the top 25 MSAs with the highest rate of workforce training providers per 10K PWD. MSAs are listed on the y-axis, rates on the x-axis. Longer bars indicate higher rates."}}
+# Ensures acs_pwd_var_by_metro_workforce_almanac_classified is available from 'get-maps-ready'
+if (exists("acs_pwd_var_by_metro_workforce_almanac_classified") &&
+    "total_providers_per_10k_labor_force_pwd" %in% names(acs_pwd_var_by_metro_workforce_almanac_classified) &&
+    "total_number_of_workforce_providers" %in% names(acs_pwd_var_by_metro_workforce_almanac_classified)) {
+
+  acs_pwd_var_by_metro_workforce_almanac_graphs <- acs_pwd_var_by_metro_workforce_almanac_classified %>%
+    mutate(NAME1 = sub(",.*", "", NAME))
+
+  top25 <- acs_pwd_var_by_metro_workforce_almanac_graphs %>%
+    arrange(desc(total_providers_per_10k_labor_force_pwd)) %>%
+    head(25)
+
+  barplot1 <- ggplot(top25, aes(x = reorder(NAME1, total_providers_per_10k_labor_force_pwd),
+                                y = total_providers_per_10k_labor_force_pwd,
+                                tooltip = paste0(NAME, "<br>Rate: ", round(total_providers_per_10k_labor_force_pwd,1),"<br>Total Providers: ", total_number_of_workforce_providers),
+                                data_id = NAME1)) +
+    geom_bar_interactive(stat = "identity", fill = "skyblue") +
+    coord_flip() +
+    theme_classic() +
+    labs(
+      title = "Top 25 MSAs by Rate of Workforce Training Providers per 10K PWD",
+      x = "Metropolitan Statistical Area (MSA)",
+      y = "Rate of workforce training providers per 10K PWD"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(size=11),
+          axis.title = element_text(size=9))
+
+  girafe(ggobj = barplot1, width_svg = 7, height_svg = 5) # Adjust size
+} else {
+  message("Data for MSA bar graph (top 25) not available or required columns missing.")
+}
+```
+
+You can download the MSA-level data used for these rankings:
+```{{r download-msa-3, echo=FALSE, results='asis'}}
+if (exists("metro_workforce_training_providers")) {
+  download_this(
+    metro_workforce_training_providers,
+    output_name = paste0("msa_top25_ranked_data_", Sys.Date()),
+    output_extension = ".xlsx",
+    button_label = paste("Download Data for MSA Rankings (Top 25, ", Sys.Date(), ")"),
+    button_type = "default",
+    has_icon = TRUE,
+    icon = "fa fa-file-excel"
+  )
+} else {
+  message("Data object 'metro_workforce_training_providers' not found for download.")
+}
+```
+
+### Bottom 25 MSAs by Rate of Workforce Training Providers
+
+```{{r bar-graph-msa-bottom-2, echo=FALSE, fig-alt="Bar chart showing the bottom 25 MSAs (including those with zero rates) for workforce training providers per 10K PWD. MSAs are listed on the y-axis, rates on the x-axis. Shorter bars indicate lower rates."}}
+if (exists("acs_pwd_var_by_metro_workforce_almanac_graphs")) { # Depends on the dataframe from previous graph chunk
+  bottom25 <- acs_pwd_var_by_metro_workforce_almanac_graphs %>%
+    arrange(total_providers_per_10k_labor_force_pwd) %>% # Ascending order for bottom
+    head(25)
+
+  barplot2 <- ggplot(bottom25, aes(x = reorder(NAME1, -total_providers_per_10k_labor_force_pwd), # Reorder to show highest of the bottom at top
+                                   y = total_providers_per_10k_labor_force_pwd,
+                                   tooltip = paste0(NAME, "<br>Rate: ", round(total_providers_per_10k_labor_force_pwd,1),"<br>Total Providers: ", total_number_of_workforce_providers),
+                                   data_id = NAME1)) +
+    geom_bar_interactive(stat = "identity", fill = "gray") +
+    coord_flip() +
+    theme_classic() +
+    labs(
+      title = "Bottom 25 MSAs by Rate of Workforce Training Providers per 10K PWD",
+      x = "Metropolitan Statistical Area (MSA)",
+      y = "Rate of workforce training providers per 10K PWD"
+    ) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(size=11),
+          axis.title = element_text(size=9))
+
+  girafe(ggobj = barplot2, width_svg = 7, height_svg = 5) # Adjust size
+} else {
+  message("Data for MSA bar graph (bottom 25) not available (acs_pwd_var_by_metro_workforce_almanac_graphs).")
+}
+```
+
+You can download the MSA-level data used for these rankings (this is the same MSA-level dataset as for the Top 25 graph):
+```{{r download-msa-4, echo=FALSE, results='asis'}}
+if (exists("metro_workforce_training_providers")) {
+  download_this(
+    metro_workforce_training_providers,
+    output_name = paste0("msa_bottom25_ranked_data_", Sys.Date()),
+    output_extension = ".xlsx",
+    button_label = paste("Download Data for MSA Rankings (Bottom 25, ", Sys.Date(), ")"),
+    button_type = "default",
+    has_icon = TRUE,
+    icon = "fa fa-file-excel"
+  )
+} else {
+  message("Data object 'metro_workforce_training_providers' not found for download.")
+}
+```
+
+## Employee Demographics
+
+This section originally contained plots for employee age, gender, and department.
+These are placeholders for now and would be different in the PWD context.
+
+```{{r employee_demographics_placeholder}}
+# Placeholder for PWD-specific demographic analysis
+# Example: Plot disability prevalence by age group or education level
+# Needs acs_data with relevant PWD variables.
+message("Placeholder for Employee Demographics (PWD context).")
+# ggplot(acs_data, aes(x = AGEP, y = DIS_PREVALENCE)) + geom_point()
+```
+
+### Key Findings:
+
+*   [Insert key finding about PWD age distribution]
+*   [Insert key finding about PWD gender representation]
+*   [Insert key finding about PWD by employment sector]
+
+## Hiring Trends
+
+This section would analyze hiring trends for PWD.
+Original content was for generic hiring_date and hiring_source.
+
+```{{r hiring_trends_placeholder}}
+# Placeholder for PWD hiring trend analysis
+# Example: Analyze number of PWD hires over time if data is available
+# Needs data on PWD hiring (e.g., from LEHD or specific employer data)
+message("Placeholder for Hiring Trends (PWD context).")
+# lehd_data %>% filter(pwd_status == "PWD") %>% group_by(year) %>% summarise(hires = sum(hires)) %>% ggplot(...)
+```
+
+### Key Findings:
+
+*   [Insert key finding about PWD hiring volume trends]
+*   [Insert key finding about top hiring sources for PWD]
+
+## Employee Retention
+
+This section would analyze retention rates for PWD.
+
+```{{r employee_retention_placeholder}}
+# Placeholder for PWD employee retention analysis
+# Example: Compare retention rates for PWD vs. non-PWD employees
+# Needs data with employment duration and PWD status
+message("Placeholder for Employee Retention (PWD context).")
+# workforce_data %>% group_by(pwd_status) %>% summarise(retention_rate = calculate_retention(...)) %>% ggplot(...)
+```
+
+### Key Findings:
+
+*   [Insert key finding about overall PWD retention rate]
+*   [Insert key finding about factors influencing PWD retention]
+
+## Conclusion and Recommendations
+
+Based on the analysis, this section summarizes the key findings and provides actionable recommendations for improving workforce management and achieving organizational goals related to PWD employment.
+
+*   [Insert recommendation 1 for PWD workforce]
+*   [Insert recommendation 2 for PWD workforce]
+*   [Insert recommendation 3 for PWD workforce]
+---
+```
